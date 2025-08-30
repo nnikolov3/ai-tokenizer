@@ -1,4 +1,5 @@
-// AI Tokenizer - standalone token budgeting and estimation service
+// Package main provides a CLI for estimating AI token counts with optional
+// normalization and JSON output.
 package main
 
 import (
@@ -6,522 +7,402 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strings"
 
-	aitokenizer "github.com/nnikolov3/ai-tokenizer"
-	"github.com/tiktoken-go/tokenizer"
+	tokenizer "github.com/nnikolov3/ai-tokenizer"
 )
+
+// TokenResult is the output payload for tokenization results.
+type TokenResult struct {
+	Text           string `json:"text"`
+	Model          string `json:"model"`
+	OriginalText   string `json:"originalText,omitempty"`
+	NormalizedText string `json:"normalizedText,omitempty"`
+	TokenCount     int    `json:"tokenCount"`
+}
 
 const (
-	defaultModel      = "gpt-4"
-	defaultMaxContext = 8192
+	// Defaults for build metadata.
+	DefaultVersion   = "dev"
+	DefaultBuildTime = "unknown"
+
+	// Output/format strings.
+	MsgVersionFmt    = "AI Tokenizer %s (built %s)\n"
+	MsgTextFmt       = "Text: %s\n"
+	MsgTokenCountFmt = "Token Count: %d\n"
+	MsgModelFmt      = "Model: %s\n"
+	MsgNormalizedFmt = "Normalized: %s\n"
+	MsgJSONIndent    = "  "
+	FmtGenericErr    = "%v"
+
+	// Error wrappers/messages.
+	ErrWrapTokenize   = "tokenize: %w"
+	ErrWrapEncodeJSON = "encode json: %w"
+	ErrWrapReadStdin  = "read stdin: %w"
+	ErrOpenFileFmt    = "failed to open file %q: %w"
+	ErrReadFileFmt    = "failed to read file %q: %w"
+	ErrNoInputMsg     = "no input"
+
+	// Flag names and help strings.
+	FlagNameVersion    = "version"
+	FlagNameJSON       = "json"
+	FlagNameFile       = "file"
+	FlagNameText       = "text"
+	FlagNameNormalized = "normalized"
+
+	FlagHelpVersion    = "Show version information"
+	FlagHelpJSON       = "Output in JSON format"
+	FlagHelpInputFile  = "Input file path (default: stdin)"
+	FlagHelpText       = "Text to tokenize"
+	FlagHelpNormalized = "Show normalized text in output"
+
+	// Usage text (lines wrapped to meet 80-char limit).
+	UsageHeader = "" +
+		"AI Tokenizer - Simple token estimation tool\n\n"
+	UsageUsageFmt = "" +
+		"Usage: %s [options] [text]\n\n"
+	UsageRules = "" +
+		"Tokenization Rules:\n" +
+		"  - 2 regular characters = 1 token\n" +
+		"  - 1 special character = 1 token\n" +
+		"  - Non-ASCII chars converted to ASCII equivalents\n\n"
+	UsageOptions     = "Options:\n"
+	UsageExamplesFmt = "" +
+		"\nExamples:\n" +
+		"  %s \"Hello, world!\"\n" +
+		"  %s -json \"Hello, world!\"\n" +
+		"  %s -file input.txt\n" +
+		"  echo \"Hello, world!\" | %s\n" +
+		"  %s -text \"café\" -normalized\n"
+
+	// CLI preview defaults and constants for helpers.
+	DefaultPreviewMax = 100
+	ExecutableDefault = "ai-tokenizer"
+	EllipsisLen       = 3
+
+	// Initial capacity guess for build settings map.
+	SettingsInitCap = 8
 )
 
-var (
-	ErrTextRequired  = errors.New("text content is required for estimation")
-	ErrModelRequired = errors.New("model name is required")
-	ErrInvalidBudget = errors.New("budget must be a positive integer")
-	ErrExceedsBudget = errors.New("text exceeds token budget")
-)
-
-type config struct {
-	text      string
-	model     string
-	budget    int
-	estimate  bool
-	chunk     bool
-	chunkSize int
-	help      bool
-	json      bool
-	encoding  string
-	decode    bool
-	encode    bool
+type VersionInfo struct {
+	Revision       string
+	BuildTimestamp string
 }
 
-type TokenEstimate struct {
-	Model        string      `json:"model"`
-	Tokens       int         `json:"tokens"`
-	Budget       int         `json:"budget,omitempty"`
-	WithinBudget bool        `json:"within_budget,omitempty"`
-	Chunks       []ChunkInfo `json:"chunks,omitempty"`
-	Encoding     string      `json:"encoding,omitempty"`
-	TokenIDs     []uint      `json:"token_ids,omitempty"`
-	DecodedText  string      `json:"decoded_text,omitempty"`
-}
+// ErrNoInput is returned when no input text is provided.
+var ErrNoInput = errors.New(ErrNoInputMsg)
 
-type ChunkInfo struct {
-	Index  int    `json:"index"`
-	Tokens int    `json:"tokens"`
-	Text   string `json:"text,omitempty"`
-}
-
-type ModelCapability struct {
-	MaxContext int    `json:"max_context"`
-	Vision     bool   `json:"vision"`
-	Encoding   string `json:"encoding"`
+// cliFlags collects parsed CLI flags for the CLI program.
+type cliFlags struct {
+	inputFile      string
+	text           string
+	showVersion    bool
+	outputJSON     bool
+	showNormalized bool
 }
 
 func main() {
-	config := parseFlags()
-
-	if config.help {
-		showHelp()
-		return
+	err := run()
+	if err != nil {
+		printError(FmtGenericErr+"\n", err)
+		os.Exit(1)
 	}
-
-	if config.encode {
-		runEncode(&config)
-		return
-	}
-
-	if config.decode {
-		runDecode(&config)
-		return
-	}
-
-	if config.estimate {
-		runEstimate(&config)
-		return
-	}
-
-	if config.chunk {
-		runChunking(&config)
-		return
-	}
-
-	showHelp()
 }
 
-func parseFlags() config {
-	var cfg config
-	flag.StringVar(&cfg.text, "text", "", "Text content to analyze (required)")
-	flag.StringVar(&cfg.model, "model", defaultModel, "Model name for capability lookup")
-	flag.IntVar(&cfg.budget, "budget", 0, "Token budget to check against")
-	flag.BoolVar(&cfg.estimate, "estimate", false, "Estimate token count for text")
-	flag.BoolVar(&cfg.chunk, "chunk", false, "Split text into chunks if over budget")
-	flag.IntVar(&cfg.chunkSize, "chunk-size", 0, "Custom chunk size (uses model max if not specified)")
-	flag.BoolVar(&cfg.json, "json", false, "Output results in JSON format")
-	flag.BoolVar(&cfg.help, "help", false, "Show help")
-	flag.BoolVar(&cfg.encode, "encode", false, "Encode text to tokens")
-	flag.BoolVar(&cfg.decode, "decode", false, "Decode tokens to text")
-	flag.StringVar(&cfg.encoding, "encoding", "", "Specific encoding to use (cl100k_base, gpt2, etc.)")
+func run() error {
+	flags := parseFlags()
+	// Handle --version early to keep branching
+	if flags.showVersion {
+		printVersion()
+
+		return nil
+	}
+	//
+	input, err := requireInput(flags)
+	if err != nil {
+		return err
+	}
+
+	return process(flags, input)
+}
+
+func requireInput(flags *cliFlags) (string, error) {
+	textInput, err := obtainInput(flags)
+	if err != nil {
+		return "", err
+	}
+
+	err = ensureNonEmpty(textInput)
+	if err != nil {
+		printError(FmtGenericErr+"\n", err)
+		printUsage()
+
+		return "", err
+	}
+
+	return textInput, nil
+}
+
+func resolveVersionAndTime() VersionInfo {
+	info := readBuildInfo()
+	settings := buildSettingsMap(info)
+
+	revision := settings["vcs.revision"]
+	if revision == "" {
+		revision = DefaultVersion
+	}
+
+	buildTimestamp := settings["vcs.time"]
+	if buildTimestamp == "" {
+		buildTimestamp = DefaultBuildTime
+	}
+
+	return VersionInfo{Revision: revision, BuildTimestamp: buildTimestamp}
+}
+
+// obtainInput resolves the input text using flags, args, or stdin.
+func obtainInput(flags *cliFlags) (string, error) {
+	return readInputNonText(flags)
+}
+
+func ensureNonEmpty(inputStr string) error {
+	if strings.TrimSpace(inputStr) == "" {
+		return ErrNoInput
+	}
+
+	return nil
+}
+
+// New helper: the pipeline after we have validated input.
+func process(flags *cliFlags, input string) error {
+	result, err := buildResult(flags, input)
+	if err != nil {
+		return fmt.Errorf(ErrWrapTokenize, err)
+	}
+
+	return emitResult(flags, result)
+}
+
+// parseFlags defines and parses CLI flags, returning a structured result.
+func parseFlags() *cliFlags {
+	showVersion := flag.Bool(FlagNameVersion, false, FlagHelpVersion)
+	outputJSON := flag.Bool(FlagNameJSON, false, FlagHelpJSON)
+	inputFile := flag.String(FlagNameFile, "", FlagHelpInputFile)
+	text := flag.String(FlagNameText, "", FlagHelpText)
+	showNormalized := flag.Bool(FlagNameNormalized, false, FlagHelpNormalized)
+
+	flag.Usage = func() { printUsage() }
 	flag.Parse()
 
-	return cfg
+	return &cliFlags{
+		showVersion:    *showVersion,
+		outputJSON:     *outputJSON,
+		inputFile:      *inputFile,
+		text:           *text,
+		showNormalized: *showNormalized,
+	}
 }
 
-func runEncode(cfg *config) {
-	if cfg.text == "" {
-		handleError(ErrTextRequired, cfg.json)
-		return
+// buildResult selects tokenization mode based on flags and returns a result.
+func buildResult(flags *cliFlags, input string) (*TokenResult, error) {
+	if flags.showNormalized {
+		return tokenizeNormalized(input)
 	}
 
-	var tokens []uint
-	var err error
+	return tokenize(input)
+}
 
-	if cfg.encoding != "" {
-		// Use specific encoding
-		encoding := tokenizer.Encoding(cfg.encoding)
-		tokens, _, err = encodeWithEncoding(cfg.text, encoding)
-	} else {
-		// Use model-based encoding
-		model := tokenizer.Model(cfg.model)
-		tokens, _, err = encodeWithModel(cfg.text, model)
+// emitResult chooses output mode based on flags and writes the result.
+func emitResult(flags *cliFlags, r *TokenResult) error {
+	if flags.outputJSON {
+		return writeJSON(r)
 	}
 
+	writePlain(r)
+
+	return nil
+}
+
+// printVersion prints version metadata derived from embedded build info.
+func printVersion() {
+	versionInfo := resolveVersionAndTime()
+	printOutput(MsgVersionFmt, versionInfo.Revision, versionInfo.BuildTimestamp)
+}
+
+// readBuildInfo retrieves build info if available.
+func readBuildInfo() *debug.BuildInfo {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return nil
+	}
+
+	return info
+}
+
+// buildSettingsMap converts build settings to a map for quick lookup.
+func buildSettingsMap(info *debug.BuildInfo) map[string]string {
+	settingsMap := make(map[string]string, SettingsInitCap)
+	if info == nil {
+		return settingsMap
+	}
+
+	for _, s := range info.Settings {
+		settingsMap[s.Key] = s.Value
+	}
+
+	return settingsMap
+}
+
+// readInputNonText considers file, args, then stdin in that order.
+
+func readInputNonText(flags *cliFlags) (string, error) {
+	if flags.inputFile != "" {
+		return readFile(flags.inputFile)
+	}
+
+	joined := strings.Join(flag.Args(), " ")
+	if joined != "" {
+		return joined, nil
+	}
+
+	return readStdin()
+}
+
+// tokenize returns a TokenResult without normalization.
+func tokenize(text string) (*TokenResult, error) {
+	tok := tokenizer.NewTokenizer()
+
+	return &TokenResult{
+		Text:           text,
+		Model:          tok.GetModel(),
+		OriginalText:   "",
+		NormalizedText: "",
+		TokenCount:     tok.EstimateTokens(text),
+	}, nil
+}
+
+// tokenizeNormalized returns a TokenResult with normalization.
+func tokenizeNormalized(text string) (*TokenResult, error) {
+	tok := tokenizer.NewTokenizer()
+	norm := tok.Normalize(text)
+
+	return &TokenResult{
+		Text:           text,
+		Model:          tok.GetModel(),
+		OriginalText:   text,
+		NormalizedText: norm,
+		TokenCount:     tok.EstimateTokens(text),
+	}, nil
+}
+
+// tokenizeText is kept for test compatibility; delegates to explicit variants.
+//
+
+func tokenizeText(text string, showNormalized bool) (*TokenResult, error) {
+	if showNormalized {
+		return tokenizeNormalized(text)
+	}
+
+	return tokenize(text)
+}
+
+// readFile reads the entire file content after sanitizing the provided path.
+func readFile(filename string) (string, error) {
+	clean := filepath.Clean(filename)
+	// #nosec G304 — path cleaned; CLI tool intended to read user-provided files.
+	data, err := os.ReadFile(clean)
 	if err != nil {
-		handleError(fmt.Errorf("encoding failed: %w", err), cfg.json)
-		return
+		return "", fmt.Errorf(ErrOpenFileFmt, filename, err)
 	}
 
-	result := TokenEstimate{
-		Model:    cfg.model,
-		Tokens:   len(tokens),
-		TokenIDs: tokens,
-		Encoding: cfg.encoding,
-	}
-
-	outputResult(result, cfg.json)
+	return string(data), nil
 }
 
-func runDecode(cfg *config) {
-	if cfg.text == "" {
-		handleError(ErrTextRequired, cfg.json)
-		return
-	}
-
-	// Parse token IDs from text (assuming comma-separated integers)
-	tokenStrs := strings.Split(cfg.text, ",")
-	var tokenIDs []uint
-	for _, tokenStr := range tokenStrs {
-		tokenStr = strings.TrimSpace(tokenStr)
-		if tokenStr == "" {
-			continue
-		}
-		var tokenID uint64
-		_, err := fmt.Sscanf(tokenStr, "%d", &tokenID)
-		if err != nil {
-			handleError(fmt.Errorf("invalid token ID: %s", tokenStr), cfg.json)
-			return
-		}
-		tokenIDs = append(tokenIDs, uint(tokenID))
-	}
-
-	var decodedText string
-	var err error
-
-	if cfg.encoding != "" {
-		// Use specific encoding
-		encoding := tokenizer.Encoding(cfg.encoding)
-		decodedText, err = decodeWithEncoding(tokenIDs, encoding)
-	} else {
-		// Use model-based encoding
-		model := tokenizer.Model(cfg.model)
-		decodedText, err = decodeWithModel(tokenIDs, model)
-	}
-
+// readStdin reads all data from standard input and wraps errors with context.
+func readStdin() (string, error) {
+	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		handleError(fmt.Errorf("decoding failed: %w", err), cfg.json)
-		return
+		return "", fmt.Errorf(ErrWrapReadStdin, err)
 	}
 
-	result := TokenEstimate{
-		Model:       cfg.model,
-		Tokens:      len(tokenIDs),
-		TokenIDs:    tokenIDs,
-		DecodedText: decodedText,
-		Encoding:    cfg.encoding,
-	}
-
-	outputResult(result, cfg.json)
+	return string(data), nil
 }
 
-func runEstimate(cfg *config) {
-	if cfg.text == "" {
-		handleError(ErrTextRequired, cfg.json)
-		return
+// printError writes formatted output to stderr; critical failure if writing fails.
+func printError(format string, args ...any) {
+	_, e := fmt.Fprintf(os.Stderr, format, args...)
+	if e != nil {
+		// If unable to write to stderr, terminate loudly.
+		panic(e)
+	}
+}
+
+// printOutput writes formatted output to stdout; critical failure if writing fails.
+func printOutput(format string, args ...any) {
+	_, e := fmt.Fprintf(os.Stdout, format, args...)
+	if e != nil {
+		// If unable to write to stdout, terminate loudly.
+		panic(e)
+	}
+}
+
+// printUsage prints the CLI usage text with examples and flag defaults.
+func printUsage() {
+	exe := ExecutableDefault
+
+	path, execErr := os.Executable()
+	if execErr == nil && path != "" {
+		exe = filepath.Base(path)
 	}
 
-	capability := getModelCapability(cfg.model)
-	var tokens int
-	var err error
+	printOutput(UsageHeader)
+	printOutput(UsageUsageFmt, exe)
+	printOutput(UsageRules)
+	printOutput(UsageOptions)
+	flag.PrintDefaults()
+	printOutput(UsageExamplesFmt, exe, exe, exe, exe, exe)
+}
 
-	if cfg.encoding != "" {
-		// Use specific encoding
-		encoding := tokenizer.Encoding(cfg.encoding)
-		tokens, err = countTokensWithEncoding(cfg.text, encoding)
-	} else {
-		// Use model-based encoding
-		model := tokenizer.Model(cfg.model)
-		tokens, err = countTokensWithModel(cfg.text, model)
+// truncateText returns a shortened representation with ellipsis if needed.
+func truncateText(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
 	}
 
+	if maxLen <= EllipsisLen {
+		return strings.Repeat(".", maxLen)
+	}
+
+	return text[:maxLen-EllipsisLen] + "..."
+}
+
+// writeJSON pretty-prints the TokenResult as JSON to stdout and wraps errors.
+func writeJSON(result *TokenResult) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", MsgJSONIndent)
+
+	err := enc.Encode(result)
 	if err != nil {
-		// Fallback to simple estimation
-		tokens = estimateTokens(cfg.text)
+		return fmt.Errorf(ErrWrapEncodeJSON, err)
 	}
 
-	result := TokenEstimate{
-		Model:    cfg.model,
-		Tokens:   tokens,
-		Encoding: cfg.encoding,
-	}
-
-	if cfg.budget > 0 {
-		result.Budget = cfg.budget
-		result.WithinBudget = tokens <= cfg.budget
-	} else if capability.MaxContext > 0 {
-		result.Budget = capability.MaxContext
-		result.WithinBudget = tokens <= capability.MaxContext
-	}
-
-	outputResult(result, cfg.json)
+	return nil
 }
 
-func runChunking(cfg *config) {
-	if cfg.text == "" {
-		handleError(ErrTextRequired, cfg.json)
-		return
+// writePlain prints a human-friendly representation to stdout.
+func writePlain(result *TokenResult) {
+	printOutput(MsgTextFmt, truncateText(result.Text, DefaultPreviewMax))
+	printOutput(MsgTokenCountFmt, result.TokenCount)
+	printOutput(MsgModelFmt, result.Model)
+
+	if result.NormalizedText != "" {
+		printOutput(
+			MsgNormalizedFmt,
+			truncateText(result.NormalizedText, DefaultPreviewMax),
+		)
 	}
-
-	capability := getModelCapability(cfg.model)
-	chunkSize := cfg.chunkSize
-	if chunkSize == 0 {
-		if cfg.budget > 0 {
-			chunkSize = cfg.budget
-		} else {
-			chunkSize = capability.MaxContext
-		}
-	}
-
-	if chunkSize <= 0 {
-		chunkSize = defaultMaxContext
-	}
-
-	chunks := chunkText(cfg.text, chunkSize, cfg.model, cfg.encoding)
-
-	result := TokenEstimate{
-		Model:        cfg.model,
-		Tokens:       estimateTokens(cfg.text),
-		Budget:       chunkSize,
-		Chunks:       chunks,
-		WithinBudget: len(chunks) == 1,
-		Encoding:     cfg.encoding,
-	}
-
-	outputResult(result, cfg.json)
-}
-
-func encodeWithModel(text string, model tokenizer.Model) ([]uint, []string, error) {
-	codec, err := tokenizer.ForModel(model)
-	if err != nil {
-		return nil, nil, err
-	}
-	return codec.Encode(text)
-}
-
-func encodeWithEncoding(text string, encoding tokenizer.Encoding) ([]uint, []string, error) {
-	codec, err := tokenizer.Get(encoding)
-	if err != nil {
-		return nil, nil, err
-	}
-	return codec.Encode(text)
-}
-
-func decodeWithModel(tokenIDs []uint, model tokenizer.Model) (string, error) {
-	codec, err := tokenizer.ForModel(model)
-	if err != nil {
-		return "", err
-	}
-	return codec.Decode(tokenIDs)
-}
-
-func decodeWithEncoding(tokenIDs []uint, encoding tokenizer.Encoding) (string, error) {
-	codec, err := tokenizer.Get(encoding)
-	if err != nil {
-		return "", err
-	}
-	return codec.Decode(tokenIDs)
-}
-
-func countTokensWithModel(text string, model tokenizer.Model) (int, error) {
-	codec, err := tokenizer.ForModel(model)
-	if err != nil {
-		return 0, err
-	}
-	return codec.Count(text)
-}
-
-func countTokensWithEncoding(text string, encoding tokenizer.Encoding) (int, error) {
-	codec, err := tokenizer.Get(encoding)
-	if err != nil {
-		return 0, err
-	}
-	return codec.Count(text)
-}
-
-func estimateTokens(text string) int {
-	// Fallback to simple token estimation: ~4 characters per token on average
-	// This is a rough approximation - real tokenization would be more accurate
-	return len(text) / 4
-}
-
-func chunkText(text string, maxTokens int, model, encoding string) []ChunkInfo {
-	// Use the tokenizer library for accurate chunking
-	var t *aitokenizer.Tokenizer
-
-	if encoding != "" {
-		// Convert string to tokenizer.Encoding type
-		tokenizerEncoding := tokenizer.Encoding(encoding)
-		t = aitokenizer.NewTokenizerWithEncoding(tokenizerEncoding)
-	} else {
-		t = aitokenizer.NewTokenizer()
-	}
-
-	// Simple word-based chunking with token counting
-	words := strings.Fields(text)
-	var chunks []ChunkInfo
-	currentChunk := ""
-	chunkIndex := 0
-
-	for _, word := range words {
-		testChunk := currentChunk
-		if testChunk != "" {
-			testChunk += " "
-		}
-		testChunk += word
-
-		// Count tokens in the test chunk
-		tokenCount := t.CountTokens(testChunk)
-
-		if tokenCount > maxTokens && currentChunk != "" {
-			// Current chunk is full, finalize it
-			chunks = append(chunks, ChunkInfo{
-				Index:  chunkIndex,
-				Tokens: t.CountTokens(currentChunk),
-				Text:   currentChunk,
-			})
-			currentChunk = word
-			chunkIndex++
-		} else {
-			currentChunk = testChunk
-		}
-	}
-
-	// Add the final chunk if there's remaining content
-	if currentChunk != "" {
-		chunks = append(chunks, ChunkInfo{
-			Index:  chunkIndex,
-			Tokens: t.CountTokens(currentChunk),
-			Text:   currentChunk,
-		})
-	}
-
-	return chunks
-}
-
-func getModelCapability(model string) ModelCapability {
-	// Capability map for common models with their encodings
-	capabilities := map[string]ModelCapability{
-		"gpt-4":             {MaxContext: 8192, Vision: true, Encoding: "cl100k_base"},
-		"gpt-4-32k":         {MaxContext: 32768, Vision: true, Encoding: "cl100k_base"},
-		"gpt-4o":            {MaxContext: 128000, Vision: true, Encoding: "cl100k_base"},
-		"gpt-3.5-turbo":     {MaxContext: 4096, Vision: false, Encoding: "cl100k_base"},
-		"gpt-3.5-turbo-16k": {MaxContext: 16384, Vision: false, Encoding: "cl100k_base"},
-		"gpt-2":             {MaxContext: 2048, Vision: false, Encoding: "gpt2"},
-		"text-davinci-003":  {MaxContext: 4097, Vision: false, Encoding: "p50k_base"},
-		"text-davinci-002":  {MaxContext: 4097, Vision: false, Encoding: "p50k_base"},
-		"code-davinci-002":  {MaxContext: 8001, Vision: false, Encoding: "p50k_base"},
-		"code-davinci-001":  {MaxContext: 8001, Vision: false, Encoding: "p50k_base"},
-		"text-curie-001":    {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"text-babbage-001":  {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"text-ada-001":      {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"davinci":           {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"curie":             {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"babbage":           {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-		"ada":               {MaxContext: 2049, Vision: false, Encoding: "r50k_base"},
-	}
-
-	if capability, exists := capabilities[model]; exists {
-		return capability
-	}
-
-	// Default capability for unknown models
-	return ModelCapability{MaxContext: defaultMaxContext, Vision: false, Encoding: "cl100k_base"}
-}
-
-func outputResult(result TokenEstimate, useJSON bool) {
-	if useJSON {
-		output, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			log.Printf("Error encoding JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(output))
-	} else {
-		fmt.Printf("Model: %s\n", result.Model)
-		if result.Encoding != "" {
-			fmt.Printf("Encoding: %s\n", result.Encoding)
-		}
-		fmt.Printf("Tokens: %d\n", result.Tokens)
-
-		if result.TokenIDs != nil {
-			fmt.Printf("Token IDs: %v\n", result.TokenIDs)
-		}
-
-		if result.DecodedText != "" {
-			fmt.Printf("Decoded text: %s\n", result.DecodedText)
-		}
-
-		if result.Budget > 0 {
-			fmt.Printf("Budget: %d tokens\n", result.Budget)
-			if result.WithinBudget {
-				fmt.Println("Status: ✓ Within budget")
-			} else {
-				fmt.Printf("Status: ✗ Exceeds budget by %d tokens\n", result.Tokens-result.Budget)
-			}
-		}
-
-		if len(result.Chunks) > 1 {
-			fmt.Printf("\nText split into %d chunks:\n", len(result.Chunks))
-			for _, chunk := range result.Chunks {
-				fmt.Printf("  Chunk %d: %d tokens\n", chunk.Index+1, chunk.Tokens)
-			}
-		}
-	}
-}
-
-func handleError(err error, useJSON bool) {
-	if useJSON {
-		errorOutput := map[string]string{"error": err.Error()}
-		output, _ := json.MarshalIndent(errorOutput, "", "  ")
-		fmt.Println(string(output))
-	} else {
-		log.Printf("Error: %v\n", err)
-	}
-	os.Exit(1)
-}
-
-func showHelp() {
-	fmt.Print(`AI Tokenizer - Standalone token budgeting and estimation service
-
-Usage: ai-tokenizer [options]
-
-Options:
-  -text TEXT        Text content to analyze (required)
-  -model NAME       Model name for capability lookup (default: gpt-4)
-  -budget NUM       Token budget to check against
-  -estimate         Estimate token count for the given text
-  -chunk            Split text into chunks if over budget
-  -chunk-size NUM   Custom chunk size (uses model max if not specified)
-  -encode           Encode text to token IDs
-  -decode           Decode token IDs to text
-  -encoding NAME    Specific encoding to use (cl100k_base, gpt2, p50k_base, r50k_base)
-  -json             Output results in JSON format
-  -help             Show this help message
-
-Examples:
-  # Estimate tokens for text
-  ai-tokenizer -estimate -text "Hello world"
-  
-  # Check if text fits within budget
-  ai-tokenizer -estimate -text "Long text..." -budget 1000
-  
-  # Encode text to tokens
-  ai-tokenizer -encode -text "Hello world"
-  
-  # Decode tokens to text
-  ai-tokenizer -decode -text "15496,1917" -model gpt-4
-  
-  # Use specific encoding
-  ai-tokenizer -encode -text "Hello world" -encoding cl100k_base
-  
-  # Chunk text for specific model
-  ai-tokenizer -chunk -model gpt-4 -text "Very long document..."
-  
-  # Custom chunk size with JSON output
-  ai-tokenizer -chunk -chunk-size 500 -json -text "Document content..."
-
-Supported Models:
-  - gpt-4, gpt-4-32k, gpt-4o (cl100k_base)
-  - gpt-3.5-turbo, gpt-3.5-turbo-16k (cl100k_base)
-  - gpt-2 (gpt2)
-  - text-davinci-003, text-davinci-002 (p50k_base)
-  - code-davinci-002, code-davinci-001 (p50k_base)
-  - text-curie-001, text-babbage-001, text-ada-001 (r50k_base)
-  - davinci, curie, babbage, ada (r50k_base)
-
-Supported Encodings:
-  - cl100k_base: GPT-4, GPT-3.5-turbo
-  - gpt2: GPT-2
-  - p50k_base: Code models
-  - r50k_base: Older GPT models
-  - p50k_edit: Edit models
-  - o200k_base: Latest models
-
-Exit codes:
-  0  Success
-  1  Error (invalid arguments, processing failed, etc.)`)
 }

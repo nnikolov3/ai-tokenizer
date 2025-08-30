@@ -1,107 +1,149 @@
-package aitokenizer
+// Package tokenizer provides simple token estimation functionality for text processing.
+// It implements a basic tokenization strategy where approximately 2 characters equal 1
+// token, and special characters (whitespace, punctuation, symbols) count as 1 token each.
+package tokenizer
 
 import (
-	"fmt"
+	"math"
 	"strings"
+	"unicode"
 
-	"github.com/tiktoken-go/tokenizer"
+	"golang.org/x/text/unicode/norm"
 )
 
-// Tokenizer provides functionality to count tokens in text content.
+// Tokenizer implements simple token estimation.
 type Tokenizer struct {
-	// Default tokenizer encoding to use
-	defaultEncoding tokenizer.Encoding
+	model string
 }
 
-// NewTokenizer creates a new tokenizer instance with default GPT-4 tokenizer.
+const (
+	// DefaultModel is the default tokenizer model name.
+	DefaultModel = "simple"
+	// CharsPerToken defines the approximate character-to-token ratio for regular
+	// characters.
+	CharsPerToken      = 2.0
+	maxASCII      rune = 0x7F
+
+	// Special character folding constants.
+	ligatureSharpS = "ss"
+	ligatureAE     = "ae"
+	ligatureOE     = "oe"
+	ligatureO      = "o"
+	ligatureTH     = "th"
+	ligatureD      = "d"
+)
+
+// NewTokenizer creates a new simple tokenizer instance.
 func NewTokenizer() *Tokenizer {
-	return &Tokenizer{
-		defaultEncoding: tokenizer.Cl100kBase,
-	}
+	return &Tokenizer{model: DefaultModel}
 }
 
-// NewTokenizerWithEncoding creates a new tokenizer instance with specified encoding.
-func NewTokenizerWithEncoding(encoding tokenizer.Encoding) *Tokenizer {
-	return &Tokenizer{
-		defaultEncoding: encoding,
-	}
-}
-
-// CountTokens estimates the number of tokens in the given content using tiktoken.
-func (t *Tokenizer) CountTokens(content string) int {
-	if content == "" {
+// EstimateTokens estimates tokens using: 2 chars = 1 token, special chars = 1 token each.
+func (t *Tokenizer) EstimateTokens(text string) int {
+	if text == "" {
 		return 0
 	}
 
-	// Use tiktoken for accurate token counting
-	tiktoken, err := tokenizer.Get(t.defaultEncoding)
-	if err != nil {
-		// Fallback to simple estimation if tiktoken fails
-		return t.fallbackCount(content)
-	}
+	normalized := t.Normalize(text)
 
-	tokens, _, err := tiktoken.Encode(content)
-	if err != nil {
-		// Fallback to simple estimation if encoding fails
-		return t.fallbackCount(content)
-	}
-
-	return len(tokens)
+	return t.countTokensFromNormalizedText(normalized)
 }
 
-// CountTokensWithLanguage estimates tokens with language-specific considerations.
-func (t *Tokenizer) CountTokensWithLanguage(content, language string) int {
-	// For now, use the same tokenizer for all languages
-	// In the future, we could use different tokenizers for different languages
-	return t.CountTokens(content)
+// Normalize converts non-ASCII characters to their ASCII equivalents.
+func (t *Tokenizer) Normalize(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	return t.processText(norm.NFD.String(text))
 }
 
-// EstimateTokensForFile estimates tokens for a file with given language.
-func (t *Tokenizer) EstimateTokensForFile(content, language string) int {
-	return t.CountTokensWithLanguage(content, language)
+// GetModel returns the tokenizer model name.
+func (t *Tokenizer) GetModel() string {
+	return t.model
 }
 
-// CountTokensForModel counts tokens using a specific OpenAI model.
-func (t *Tokenizer) CountTokensForModel(content string, model tokenizer.Model) (int, error) {
-	if content == "" {
-		return 0, nil
+// processText handles the main normalization logic.
+func (t *Tokenizer) processText(nfd string) string {
+	var builder strings.Builder
+	builder.Grow(len(nfd))
+
+	for _, r := range nfd {
+		if out := normalizeRune(r); out != "" {
+			builder.WriteString(out)
+		}
 	}
 
-	tiktoken, err := tokenizer.ForModel(model)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get tokenizer for model %s: %w", model, err)
-	}
-
-	tokens, _, err := tiktoken.Encode(content)
-	if err != nil {
-		return 0, fmt.Errorf("failed to encode content with model %s: %w", model, err)
-	}
-
-	return len(tokens), nil
+	return builder.String()
 }
 
-// CountTokensForEncoding counts tokens using a specific encoding.
-func (t *Tokenizer) CountTokensForEncoding(content string, encoding tokenizer.Encoding) (int, error) {
-	if content == "" {
-		return 0, nil
+func (t *Tokenizer) countTokensFromNormalizedText(normalized string) int {
+	tokenCount := 0
+	charCount := 0
+
+	for _, r := range normalized {
+		if isSpecialChar(r) {
+			tokenCount += t.addAccumulatedCharTokens(charCount)
+
+			charCount = 0
+			tokenCount++
+
+			continue
+		}
+
+		charCount++
 	}
 
-	tiktoken, err := tokenizer.Get(encoding)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get tokenizer for encoding %s: %w", encoding, err)
-	}
+	tokenCount += t.addAccumulatedCharTokens(charCount)
 
-	tokens, _, err := tiktoken.Encode(content)
-	if err != nil {
-		return 0, fmt.Errorf("failed to encode content with encoding %s: %w", encoding, err)
-	}
-
-	return len(tokens), nil
+	return tokenCount
 }
 
-// fallbackCount provides a simple fallback token counting method.
-func (t *Tokenizer) fallbackCount(content string) int {
-	// Simple word-based estimation as fallback
-	words := strings.Fields(content)
-	return len(words)
+func (t *Tokenizer) addAccumulatedCharTokens(charCount int) int {
+	if charCount <= 0 {
+		return 0
+	}
+
+	return int(math.Ceil(float64(charCount) / CharsPerToken))
+}
+
+// normalizeRune converts a rune to its ASCII representation.
+func normalizeRune(inputRune rune) string {
+	if unicode.Is(unicode.Mn, inputRune) {
+		return ""
+	}
+
+	if inputRune <= maxASCII {
+		return string(inputRune)
+	}
+
+	return foldSpecialRune(inputRune)
+}
+
+// foldSpecialRune handles Unicode character folding to ASCII.
+func foldSpecialRune(inputRune rune) string {
+	// specialRuneMap maps Unicode characters to their ASCII equivalents.
+	specialRuneMap := map[rune]string{
+		'ß': ligatureSharpS,
+		'Æ': ligatureAE,
+		'æ': ligatureAE,
+		'Œ': ligatureOE,
+		'œ': ligatureOE,
+		'Ø': ligatureO,
+		'ø': ligatureO,
+		'Þ': ligatureTH,
+		'þ': ligatureTH,
+		'Ð': ligatureD,
+		'ð': ligatureD,
+	}
+
+	if replacement, exists := specialRuneMap[inputRune]; exists {
+		return replacement
+	}
+
+	return ""
+}
+
+func isSpecialChar(inputRune rune) bool {
+	return !unicode.IsLetter(inputRune) && !unicode.IsDigit(inputRune)
 }

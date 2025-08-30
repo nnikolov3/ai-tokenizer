@@ -1,339 +1,356 @@
-package aitokenizer
+package tokenizer_test
 
 import (
+	"strings"
 	"testing"
 
-	"github.com/tiktoken-go/tokenizer"
+	tokenizer "github.com/nnikolov3/ai-tokenizer"
 )
 
-func TestNewTokenizer(t *testing.T) {
-	tok := NewTokenizer()
+// toASCII is a test-only helper that mirrors ASCII folding using the production
+// Normalize.
+// It returns 0 when the rune cannot be represented after normalization.
+func toASCII(r rune) rune {
+	tok := tokenizer.NewTokenizer()
+
+	out := tok.Normalize(string(r))
+	if out == "" {
+		return 0
+	}
+
+	rs := []rune(out)
+
+	return rs[0]
+}
+
+// Test constants to eliminate duplication and magic numbers.
+const (
+	// Error message formats.
+	EstimateTokensErrorFormat = "EstimateTokens(%q) = %d, want %d"
+	NormalizeErrorFormat      = "Normalize(%q) = %q, want %q"
+	ToASCIIErrorFormat        = "toASCII(%c) = %c, want %c"
+	GetModelErrorFormat       = "GetModel() = %q, want %q"
+
+	// Common test strings.
+	EmptyString     = ""
+	SingleChar      = "a"
+	TwoChars        = "ab"
+	ThreeChars      = "abc"
+	FourChars       = "abcd"
+	HelloWorld      = "hello world"
+	CafeUnicode     = "café"
+	NaiveUnicode    = "naïve"
+	MullerUmlaut    = "Müller"
+	HanScriptText   = "Hello\u4e16\u754c"                                    // Han characters for testing (世界)
+	MixedScriptText = "café\u4e16\u754c\u043f\u0440\u0438\u0432\u0435\u0442" // Mixed scripts for testing (世界привет)
+
+	// Benchmark strings.
+	BenchmarkEstimateText = "This is a benchmark test for the tokenizer estimation " +
+		"functionality. It should measure the performance of token counting " +
+		"with special characters!"
+	BenchmarkNormalizeText = "This is a tëst with spéciål chäracters and unicode " +
+		"tëxt for nørmalization benchmarking."
+
+	// Error messages.
+	GetModelEmptyError   = "GetModel() returned empty string"
+	NewTokenizerNilError = "tokenizer.NewTokenizer() returned nil"
+	EmptyEstimateError   = "EstimateTokens(\"\") = %d, want 0"
+	EmptyNormalizeError  = "Normalize(\"\") = %q, want \"\""
+	NegativeTokensError  = "EstimateTokens returned negative value: %d for input %q"
+	NonASCIIResultError  = "Normalize returned non-ASCII character %c in %q from input %q"
+)
+
+type TokenEstimateTestCase struct {
+	name     string
+	input    string
+	expected int
+}
+
+type NormalizeTestCase struct {
+	name     string
+	input    string
+	expected string
+}
+
+type ToASCIITestCase struct {
+	name     string
+	input    rune
+	expected rune
+}
+
+func getTokenEstimateTestCases() []TokenEstimateTestCase {
+	return []TokenEstimateTestCase{
+		{"empty string", EmptyString, 0},
+		{"single character", SingleChar, 1},
+		{"two characters", TwoChars, 1},
+		{"three characters", ThreeChars, 2},
+		{"four characters", FourChars, 2},
+		{"special character alone", "!", 1},
+		{"multiple special characters", "!@#", 3},
+		{"mixed text and special chars", "hello!world", 7},
+		{"text with punctuation", "Hello, world!", 9},
+		{"non-ASCII characters (unicode)", CafeUnicode, 2},
+		{"mixed unicode and special chars", "naïve!", 4},
+		{"whitespace", "   ", 3}, // three spaces -> three special tokens
+		{"newlines and tabs", "\n\t", 2},
+	}
+}
+
+func TestTokenizerEstimate(t *testing.T) {
+	t.Parallel()
+
+	tests := getTokenEstimateTestCases()
+	tok := tokenizer.NewTokenizer()
+
+	runTokenEstimateTests(t, tok, tests)
+}
+
+func runTokenEstimateTests(
+	t *testing.T,
+	tok *tokenizer.Tokenizer,
+	tests []TokenEstimateTestCase,
+) {
+	t.Helper()
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			validateTokenEstimate(t, tok, testCase)
+		})
+	}
+}
+
+func validateTokenEstimate(
+	t *testing.T,
+	tok *tokenizer.Tokenizer,
+	testCase TokenEstimateTestCase,
+) {
+	t.Helper()
+
+	result := tok.EstimateTokens(testCase.input)
+	if result != testCase.expected {
+		t.Errorf(
+			EstimateTokensErrorFormat,
+			testCase.input,
+			result,
+			testCase.expected,
+		)
+	}
+}
+
+func getNormalizeTestCases() []NormalizeTestCase {
+	return []NormalizeTestCase{
+		{"ASCII text unchanged", HelloWorld, HelloWorld},
+		{"accented characters", CafeUnicode, "cafe"},
+		{"various diacritics", "naïve résumé", "naive resume"},
+		{"German umlauts", MullerUmlaut, "Muller"},
+		{"mixed ASCII and Unicode", "Hello café!", "Hello cafe!"},
+		{"empty string", EmptyString, EmptyString},
+	}
+}
+
+func TestTokenizerNormalize(t *testing.T) {
+	t.Parallel()
+
+	tests := getNormalizeTestCases()
+	tok := tokenizer.NewTokenizer()
+
+	runNormalizeTests(t, tok, tests)
+}
+
+func runNormalizeTests(
+	t *testing.T,
+	tok *tokenizer.Tokenizer,
+	tests []NormalizeTestCase,
+) {
+	t.Helper()
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			validateNormalize(t, tok, testCase)
+		})
+	}
+}
+
+func validateNormalize(
+	t *testing.T,
+	tok *tokenizer.Tokenizer,
+	testCase NormalizeTestCase,
+) {
+	t.Helper()
+
+	result := tok.Normalize(testCase.input)
+	if result != testCase.expected {
+		t.Errorf(
+			NormalizeErrorFormat,
+			testCase.input,
+			result,
+			testCase.expected,
+		)
+	}
+}
+
+func TestTokenizerGetModel(t *testing.T) {
+	t.Parallel()
+
+	tok := tokenizer.NewTokenizer()
+
+	model := tok.GetModel()
+	if model == EmptyString {
+		t.Error(GetModelEmptyError)
+	}
+
+	if model != tokenizer.DefaultModel {
+		t.Errorf(GetModelErrorFormat, model, tokenizer.DefaultModel)
+	}
+}
+
+func BenchmarkTokenizerEstimate(b *testing.B) {
+	tok := tokenizer.NewTokenizer()
+	text := BenchmarkEstimateText
+
+	b.ResetTimer()
+
+	for range b.N {
+		_ = tok.EstimateTokens(text)
+	}
+}
+
+func BenchmarkTokenizerNormalize(b *testing.B) {
+	tok := tokenizer.NewTokenizer()
+	text := BenchmarkNormalizeText
+
+	b.ResetTimer()
+
+	for range b.N {
+		_ = tok.Normalize(text)
+	}
+}
+
+func getEdgeCaseEstimateTestCases() []TokenEstimateTestCase {
+	return []TokenEstimateTestCase{
+		{"very long text", strings.Repeat(TwoChars, 1000), 1000},
+		{"only special characters", "!@#$%^&*()", 10},
+		{
+			"mixed languages",
+			HanScriptText,
+			3,
+		}, // Hello -> 3 tokens (5 letters -> ceil(5/2)=3), 世界 dropped by Normalize
+		{"emoji and symbols", "😀👍🎉", 0}, // dropped by Normalize
+		{"numbers and letters", "abc123def", 5},
+		{"tabs and newlines mixed", "a\tb\nc\rd", 7},
+		{"repeated spaces", " hello world ", 9}, // spaces are special tokens
+		{"mixed case with accents", "CAFÉ café", 5},
+	}
+}
+
+func TestTokenizerEstimateEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := getEdgeCaseEstimateTestCases()
+	tok := tokenizer.NewTokenizer()
+
+	runTokenEstimateTests(t, tok, tests)
+}
+
+func getEdgeCaseNormalizeTestCases() []NormalizeTestCase {
+	return []NormalizeTestCase{
+		{"complex diacritics", "àáâãäåçèéêë", "aaaaaaceeee"},
+		{"uppercase with diacritics", "ÀÁÂÃÄÅÇÈÉÊË", "AAAAAACEEEE"},
+		{"mixed scripts", MixedScriptText, "cafe"},
+		{"special ligatures", "ﬁﬂ", EmptyString},
+		{"already ASCII", "abcDEF123!@#", "abcDEF123!@#"},
+		{"combining characters", "a\u0301b\u0302c\u0308", "abc"},
+	}
+}
+
+func TestTokenizerNormalizeEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := getEdgeCaseNormalizeTestCases()
+	tok := tokenizer.NewTokenizer()
+
+	runNormalizeTests(t, tok, tests)
+}
+
+func getToASCIITestCases() []ToASCIITestCase {
+	return []ToASCIITestCase{
+		{"ASCII a", 'a', 'a'},
+		{"ASCII Z", 'Z', 'Z'},
+		{"digit 5", '5', '5'},
+		{"accented a", 'à', 'a'},
+		{"accented A", 'À', 'A'},
+		{"non-convertible", '世', 0},
+		{"non-ASCII symbol", '€', 0},
+	}
+}
+
+func TestToASCII(t *testing.T) {
+	t.Parallel()
+
+	tests := getToASCIITestCases()
+	runToASCIITests(t, tests)
+}
+
+func runToASCIITests(t *testing.T, tests []ToASCIITestCase) {
+	t.Helper()
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			validateToASCII(t, testCase)
+		})
+	}
+}
+
+func validateToASCII(t *testing.T, testCase ToASCIITestCase) {
+	t.Helper()
+
+	result := toASCII(testCase.input)
+	if result != testCase.expected {
+		t.Errorf(
+			ToASCIIErrorFormat,
+			testCase.input,
+			result,
+			testCase.expected,
+		)
+	}
+}
+
+func testTokenizerCreation(t *testing.T) *tokenizer.Tokenizer {
+	t.Helper()
+
+	tok := tokenizer.NewTokenizer()
 	if tok == nil {
-		t.Fatal("NewTokenizer() returned nil")
+		t.Error(NewTokenizerNilError)
+	}
+
+	return tok
+}
+
+func testEmptyStringEstimate(t *testing.T, tok *tokenizer.Tokenizer) {
+	t.Helper()
+
+	result := tok.EstimateTokens(EmptyString)
+	if result != 0 {
+		t.Errorf(EmptyEstimateError, result)
 	}
 }
 
-func TestNewTokenizerWithEncoding(t *testing.T) {
-	tests := []struct {
-		name     string
-		encoding tokenizer.Encoding
-	}{
-		{"cl100k_base", tokenizer.Cl100kBase},
-		{"gpt2", tokenizer.GPT2Enc},
-		{"p50k_base", tokenizer.P50kBase},
-		{"r50k_base", tokenizer.R50kBase},
-	}
+func testEmptyStringNormalize(t *testing.T, tok *tokenizer.Tokenizer) {
+	t.Helper()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tok := NewTokenizerWithEncoding(tt.encoding)
-			if tok == nil {
-				t.Fatal("NewTokenizerWithEncoding() returned nil")
-			}
-		})
+	normalized := tok.Normalize(EmptyString)
+	if normalized != EmptyString {
+		t.Errorf(EmptyNormalizeError, normalized)
 	}
 }
 
-func TestCountTokens(t *testing.T) {
-	tok := NewTokenizer()
+func TestTokenizerNilSafety(t *testing.T) {
+	t.Parallel()
 
-	tests := []struct {
-		name     string
-		content  string
-		expected int
-	}{
-		{"empty string", "", 0},
-		{"single word", "hello", 1},
-		{"two words", "hello world", 2},
-		{"sentence", "Hello world, how are you?", 6},
-		{"longer text", "This is a longer text that should have more tokens than the previous examples.", 15},
-		{"special characters", "Hello! @#$%^&*()", 4},
-		{"numbers", "123 456 789", 3},
-		{"mixed content", "Hello123 world! @#$", 5},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tok.CountTokens(tt.content)
-			if result < 0 {
-				t.Errorf("CountTokens() returned negative value: %d", result)
-			}
-			// Note: We can't test exact values since tokenization can vary
-			// but we can test that it returns reasonable values
-			if tt.content == "" && result != 0 {
-				t.Errorf("CountTokens() for empty string = %d, want 0", result)
-			}
-		})
-	}
-}
-
-func TestCountTokensWithLanguage(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name     string
-		content  string
-		language string
-	}{
-		{"english", "Hello world", "en"},
-		{"spanish", "Hola mundo", "es"},
-		{"french", "Bonjour le monde", "fr"},
-		{"german", "Hallo Welt", "de"},
-		{"chinese", "你好世界", "zh"},
-		{"japanese", "こんにちは世界", "ja"},
-		{"empty content", "", "en"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tok.CountTokensWithLanguage(tt.content, tt.language)
-			if result < 0 {
-				t.Errorf("CountTokensWithLanguage() returned negative value: %d", result)
-			}
-			if tt.content == "" && result != 0 {
-				t.Errorf("CountTokensWithLanguage() for empty string = %d, want 0", result)
-			}
-		})
-	}
-}
-
-func TestEstimateTokensForFile(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name     string
-		content  string
-		language string
-	}{
-		{"go file", "package main\n\nfunc main() {\n\tfmt.Println(\"Hello\")\n}", "go"},
-		{"python file", "def hello():\n    print('Hello, World!')", "python"},
-		{"javascript file", "function hello() {\n    console.log('Hello, World!');\n}", "javascript"},
-		{"markdown file", "# Title\n\nThis is some **markdown** content.", "markdown"},
-		{"empty file", "", "text"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tok.EstimateTokensForFile(tt.content, tt.language)
-			if result < 0 {
-				t.Errorf("EstimateTokensForFile() returned negative value: %d", result)
-			}
-			if tt.content == "" && result != 0 {
-				t.Errorf("EstimateTokensForFile() for empty string = %d, want 0", result)
-			}
-		})
-	}
-}
-
-func TestCountTokensForModel(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name    string
-		content string
-		model   tokenizer.Model
-		wantErr bool
-	}{
-		{"gpt-4", "Hello world", tokenizer.GPT4, false},
-		{"gpt-3.5-turbo", "Hello world", tokenizer.GPT35Turbo, false},
-		{"gpt-2", "Hello world", tokenizer.GPT2, true}, // GPT2 encoding not supported in this version
-		{"text-davinci-003", "Hello world", tokenizer.TextDavinci003, false},
-		{"empty content", "", tokenizer.GPT4, false},
-		{"invalid model", "Hello world", tokenizer.Model("invalid-model"), true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tok.CountTokensForModel(tt.content, tt.model)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("CountTokensForModel() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("CountTokensForModel() unexpected error: %v", err)
-				return
-			}
-
-			if result < 0 {
-				t.Errorf("CountTokensForModel() returned negative value: %d", result)
-			}
-
-			if tt.content == "" && result != 0 {
-				t.Errorf("CountTokensForModel() for empty string = %d, want 0", result)
-			}
-		})
-	}
-}
-
-func TestCountTokensForEncoding(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name     string
-		content  string
-		encoding tokenizer.Encoding
-		wantErr  bool
-	}{
-		{"cl100k_base", "Hello world", tokenizer.Cl100kBase, false},
-		{"gpt2", "Hello world", tokenizer.GPT2Enc, true}, // GPT2 encoding not supported in this version
-		{"p50k_base", "Hello world", tokenizer.P50kBase, false},
-		{"r50k_base", "Hello world", tokenizer.R50kBase, false},
-		{"empty content", "", tokenizer.Cl100kBase, false},
-		{"invalid encoding", "Hello world", tokenizer.Encoding("invalid-encoding"), true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tok.CountTokensForEncoding(tt.content, tt.encoding)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("CountTokensForEncoding() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("CountTokensForEncoding() unexpected error: %v", err)
-				return
-			}
-
-			if result < 0 {
-				t.Errorf("CountTokensForEncoding() returned negative value: %d", result)
-			}
-
-			if tt.content == "" && result != 0 {
-				t.Errorf("CountTokensForEncoding() for empty string = %d, want 0", result)
-			}
-		})
-	}
-}
-
-func TestFallbackCount(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name     string
-		content  string
-		expected int
-	}{
-		{"empty string", "", 0},
-		{"single word", "hello", 1},
-		{"two words", "hello world", 2},
-		{"multiple words", "hello world how are you", 5},
-		{"with punctuation", "hello, world! how are you?", 5},
-		{"with numbers", "hello 123 world 456", 4},
-		{"with special chars", "hello @#$ world", 3},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tok.fallbackCount(tt.content)
-			if result != tt.expected {
-				t.Errorf("fallbackCount() = %d, want %d", result, tt.expected)
-			}
-		})
-	}
-}
-
-// Benchmark tests
-func BenchmarkCountTokens(b *testing.B) {
-	tok := NewTokenizer()
-	content := "This is a benchmark test for token counting. It contains multiple sentences and should provide a good measure of performance."
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tok.CountTokens(content)
-	}
-}
-
-func BenchmarkCountTokensWithLanguage(b *testing.B) {
-	tok := NewTokenizer()
-	content := "This is a benchmark test for token counting with language specification."
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tok.CountTokensWithLanguage(content, "en")
-	}
-}
-
-func BenchmarkCountTokensForModel(b *testing.B) {
-	tok := NewTokenizer()
-	content := "This is a benchmark test for model-specific token counting."
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tok.CountTokensForModel(content, tokenizer.GPT4)
-	}
-}
-
-func BenchmarkCountTokensForEncoding(b *testing.B) {
-	tok := NewTokenizer()
-	content := "This is a benchmark test for encoding-specific token counting."
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tok.CountTokensForEncoding(content, tokenizer.Cl100kBase)
-	}
-}
-
-// Test tokenizer consistency
-func TestTokenizerConsistency(t *testing.T) {
-	tok := NewTokenizer()
-	content := "Hello world, this is a test."
-
-	// Count should be consistent
-	count1 := tok.CountTokens(content)
-	count2 := tok.CountTokens(content)
-
-	if count1 != count2 {
-		t.Errorf("Token count not consistent: first=%d, second=%d", count1, count2)
-	}
-}
-
-// Test different encodings produce different results
-func TestEncodingDifferences(t *testing.T) {
-	content := "Hello world"
-
-	cl100k := NewTokenizerWithEncoding(tokenizer.Cl100kBase)
-	gpt2 := NewTokenizerWithEncoding(tokenizer.GPT2Enc)
-
-	count1 := cl100k.CountTokens(content)
-	count2 := gpt2.CountTokens(content)
-
-	// Different encodings should produce different token counts
-	// (though this might not always be true for very short texts)
-	if count1 == count2 && len(content) > 5 {
-		t.Logf("Warning: Different encodings produced same token count: %d", count1)
-	}
-}
-
-// Test edge cases
-func TestEdgeCases(t *testing.T) {
-	tok := NewTokenizer()
-
-	tests := []struct {
-		name    string
-		content string
-	}{
-		{"very long text", string(make([]byte, 10000))},
-		{"unicode characters", "Hello 世界 🌍"},
-		{"newlines", "Hello\nworld\r\nhow\nare\nyou"},
-		{"tabs", "Hello\tworld\thow\tare\tyou"},
-		{"mixed whitespace", "Hello   world\n\t  how   are   you"},
-		{"special unicode", "Hello\u0000world\u0001test"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tok.CountTokens(tt.content)
-			if result < 0 {
-				t.Errorf("CountTokens() returned negative value for %s: %d", tt.name, result)
-			}
-		})
-	}
+	tok := testTokenizerCreation(t)
+	testEmptyStringEstimate(t, tok)
+	testEmptyStringNormalize(t, tok)
 }

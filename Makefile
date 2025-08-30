@@ -110,14 +110,14 @@ clean:
 .PHONY: install
 install: build
 	@echo "Installing $(BINARY_NAME)..."
-	cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
+	@echo "Binary installed at: $(BUILD_DIR)/$(BINARY_NAME)"
 	@echo "Installation complete"
 
 # Uninstall the binary
 .PHONY: uninstall
 uninstall:
 	@echo "Uninstalling $(BINARY_NAME)..."
-	rm -f /usr/local/bin/$(BINARY_NAME)
+	rm -f $(BUILD_DIR)/$(BINARY_NAME)
 	@echo "Uninstallation complete"
 
 # Run the application

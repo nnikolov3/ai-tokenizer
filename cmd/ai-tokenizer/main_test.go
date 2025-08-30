@@ -1,734 +1,563 @@
 package main
 
 import (
-	"flag"
-	"io"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/tiktoken-go/tokenizer"
 )
 
-func TestParseFlags(t *testing.T) {
-	// Save original args
-	originalArgs := os.Args
-	defer func() { os.Args = originalArgs }()
+const (
+	// Common format strings and messages.
+	fmtExpErr          = "tokenizeText(%q) expected error, got nil"
+	fmtUnexpErr        = "tokenizeText(%q) unexpected error: %v"
+	fmtNilResult       = "tokenizeText(%q) returned nil result"
+	fmtTextMismatch    = "tokenizeText(%q) result.Text = %q, want %q"
+	fmtNegCount        = "tokenizeText(%q) returned negative token count: %d"
+	fmtEmptyModel      = "tokenizeText(%q) returned empty model"
+	fmtOrigMismatch    = "tokenizeText(%q) result.OriginalText = %q, want %q"
+	fmtEmptyNorm       = "tokenizeText(%q) returned empty normalized text"
+	fmtOrigShouldEmpty = "tokenizeText(%q) result.OriginalText should be empty when showNormalized=false"
+	fmtNormShouldEmpty = "tokenizeText(%q) result.NormalizedText should be empty when showNormalized=false"
+	fmtTruncateText    = "truncateText(%q, %d) = %q, want %q"
 
-	tests := []struct {
-		name     string
-		args     []string
-		expected config
-	}{
+	// File and IO constants.
+	sampleFileContent = "This is a test file content.\nWith multiple lines!"
+	invalidPath       = "/nonexistent/file.txt"
+	testFileName      = "test_tokenizer_input.txt"
+
+	// Skip messages.
+	skipReadStdin = "readStdin() requires stdin mocking"
+
+	// Read-file messages.
+	fmtReadFileErr  = "readFile() error: %v"
+	fmtReadFileWant = "readFile() = %q, want %q"
+	fmtShouldErrNE  = "readFile() should return error for non-existent file"
+
+	// JSON messages.
+	fmtTokErr           = "tokenizeText() error: %v"
+	fmtJSONUnmarshalErr = "JSON unmarshaling failed: %v"
+	fmtRoundtripText    = "JSON roundtrip: Text = %q, want %q"
+	fmtRoundtripTokens  = "JSON roundtrip: TokenCount = %d, want %d"
+	fmtRoundtripModel   = "JSON roundtrip: Model = %q, want %q"
+	fmtMissingField     = "JSON output missing field: %s\nFull JSON: %s"
+	fmtJSONMarshalErr   = "json.Marshal error: %v"
+
+	// Version logs.
+	logEmptyVersion   = "Version is empty (expected in test environment)"
+	logEmptyBuildTime = "BuildTime is empty (expected in test environment)"
+
+	// Sample strings for tests - consolidated duplicates.
+	hello      = "hello"
+	helloWorld = "Hello, world!"
+	simpleText = "simple"
+	testValue  = "test" // unified constant
+
+	sampleOrig = "tëst"
+
+	// Benchmarks.
+	benchInput = "This is a benchmark test for the tokenization function with some unicode characters like café and naïve."
+	benchOrig  = "benchmark tëst"
+
+	// JSON field expectations.
+	jsonTextField       = `"text":"test"`
+	jsonTokenCountField = `"tokenCount":5`
+	jsonModelField      = `"model":"simple"`
+	jsonOriginalText    = `"originalText":"tëst"`
+	jsonNormalizedText  = `"normalizedText":"test"`
+
+	// Test names.
+	edgeCasePrefix = "edge_case"
+)
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
+// Simple validation functions with complexity <= 3.
+func validateText(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.Text != input {
+		t.Errorf(fmtTextMismatch, input, result.Text, input)
+	}
+}
+
+func validateTokenCount(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.TokenCount < 0 {
+		t.Errorf(fmtNegCount, input, result.TokenCount)
+	}
+}
+
+func validateModel(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.Model == "" {
+		t.Errorf(fmtEmptyModel, input)
+	}
+}
+
+func validateOriginalText(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.OriginalText != input {
+		t.Errorf(fmtOrigMismatch, input, result.OriginalText, input)
+	}
+}
+
+func validateNormalizedNotEmpty(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if input != "" && result.NormalizedText == "" {
+		t.Errorf(fmtEmptyNorm, input)
+	}
+}
+
+func validateOriginalEmpty(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.OriginalText != "" {
+		t.Errorf(fmtOrigShouldEmpty, input)
+	}
+}
+
+func validateNormalizedEmpty(t *testing.T, input string, result *TokenResult) {
+	t.Helper()
+
+	if result.NormalizedText != "" {
+		t.Errorf(fmtNormShouldEmpty, input)
+	}
+}
+
+func assertTokenCommon(
+	t *testing.T,
+	input string,
+	showNormalized bool,
+	result *TokenResult,
+) {
+	t.Helper()
+
+	if result == nil {
+		t.Errorf(fmtNilResult, input)
+
+		return
+	}
+
+	validateText(t, input, result)
+	validateTokenCount(t, input, result)
+	validateModel(t, input, result)
+
+	if showNormalized {
+		validateOriginalText(t, input, result)
+		validateNormalizedNotEmpty(t, input, result)
+	} else {
+		validateOriginalEmpty(t, input, result)
+		validateNormalizedEmpty(t, input, result)
+	}
+}
+
+type tokenTestCase struct {
+	name           string
+	input          string
+	showNormalized bool
+	expectError    bool
+}
+
+func handleExpectedError(t *testing.T, input string, err error) bool {
+	t.Helper()
+
+	if err == nil {
+		t.Errorf(fmtExpErr, input)
+	}
+
+	return true
+}
+
+func handleUnexpectedError(t *testing.T, input string, err error) bool {
+	t.Helper()
+
+	if err != nil {
+		t.Errorf(fmtUnexpErr, input, err)
+
+		return true
+	}
+
+	return false
+}
+
+func runTokenizeTest(t *testing.T, testCase tokenTestCase) {
+	t.Helper()
+	t.Parallel()
+
+	result, err := tokenizeText(testCase.input, testCase.showNormalized)
+
+	if testCase.expectError {
+		handleExpectedError(t, testCase.input, err)
+
+		return
+	}
+
+	if handleUnexpectedError(t, testCase.input, err) {
+		return
+	}
+
+	assertTokenCommon(t, testCase.input, testCase.showNormalized, result)
+}
+
+func TestTokenizeText(t *testing.T) {
+	t.Parallel()
+
+	tests := []tokenTestCase{
 		{
-			name: "default config",
-			args: []string{"ai-tokenizer"},
-			expected: config{
-				text:      "",
-				model:     "gpt-4",
-				budget:    0,
-				estimate:  false,
-				chunk:     false,
-				chunkSize: 0,
-				help:      false,
-				json:      false,
-				encoding:  "",
-				decode:    false,
-				encode:    false,
-			},
+			name:           "simple text",
+			input:          helloWorld,
+			showNormalized: false,
+			expectError:    false,
 		},
 		{
-			name: "with text and estimate",
-			args: []string{"ai-tokenizer", "-text", "Hello world", "-estimate"},
-			expected: config{
-				text:      "Hello world",
-				model:     "gpt-4",
-				budget:    0,
-				estimate:  true,
-				chunk:     false,
-				chunkSize: 0,
-				help:      false,
-				json:      false,
-				encoding:  "",
-				decode:    false,
-				encode:    false,
-			},
+			name:           "empty text",
+			input:          "",
+			showNormalized: false,
+			expectError:    false,
 		},
 		{
-			name: "with all options",
-			args: []string{"ai-tokenizer", "-text", "Test", "-model", "gpt-3.5-turbo", "-budget", "1000", "-chunk", "-chunk-size", "500", "-json", "-encoding", "cl100k_base"},
-			expected: config{
-				text:      "Test",
-				model:     "gpt-3.5-turbo",
-				budget:    1000,
-				estimate:  false,
-				chunk:     true,
-				chunkSize: 500,
-				help:      false,
-				json:      true,
-				encoding:  "cl100k_base",
-				decode:    false,
-				encode:    false,
-			},
+			name:           "unicode text with normalization",
+			input:          "café",
+			showNormalized: true,
+			expectError:    false,
+		},
+		{
+			name:           "special characters",
+			input:          "!@#$%",
+			showNormalized: false,
+			expectError:    false,
+		},
+		{
+			name:           "mixed content",
+			input:          "Hello! How are you? 123",
+			showNormalized: true,
+			expectError:    false,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Reset flag state
-			flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-
-			// Set args
-			os.Args = tt.args
-
-			// Parse flags
-			result := parseFlags()
-
-			// Compare results
-			if result.text != tt.expected.text {
-				t.Errorf("text = %q, want %q", result.text, tt.expected.text)
-			}
-			if result.model != tt.expected.model {
-				t.Errorf("model = %q, want %q", result.model, tt.expected.model)
-			}
-			if result.budget != tt.expected.budget {
-				t.Errorf("budget = %d, want %d", result.budget, tt.expected.budget)
-			}
-			if result.estimate != tt.expected.estimate {
-				t.Errorf("estimate = %v, want %v", result.estimate, tt.expected.estimate)
-			}
-			if result.chunk != tt.expected.chunk {
-				t.Errorf("chunk = %v, want %v", result.chunk, tt.expected.chunk)
-			}
-			if result.chunkSize != tt.expected.chunkSize {
-				t.Errorf("chunkSize = %d, want %d", result.chunkSize, tt.expected.chunkSize)
-			}
-			if result.help != tt.expected.help {
-				t.Errorf("help = %v, want %v", result.help, tt.expected.help)
-			}
-			if result.json != tt.expected.json {
-				t.Errorf("json = %v, want %v", result.json, tt.expected.json)
-			}
-			if result.encoding != tt.expected.encoding {
-				t.Errorf("encoding = %q, want %q", result.encoding, tt.expected.encoding)
-			}
-			if result.decode != tt.expected.decode {
-				t.Errorf("decode = %v, want %v", result.decode, tt.expected.decode)
-			}
-			if result.encode != tt.expected.encode {
-				t.Errorf("encode = %v, want %v", result.encode, tt.expected.encode)
-			}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			runTokenizeTest(t, testCase)
 		})
 	}
 }
 
-func TestGetModelCapability(t *testing.T) {
-	tests := []struct {
-		name     string
-		model    string
-		expected ModelCapability
-	}{
-		{
-			name:  "gpt-4",
-			model: "gpt-4",
-			expected: ModelCapability{
-				MaxContext: 8192,
-				Vision:     true,
-				Encoding:   "cl100k_base",
-			},
-		},
-		{
-			name:  "gpt-3.5-turbo",
-			model: "gpt-3.5-turbo",
-			expected: ModelCapability{
-				MaxContext: 4096,
-				Vision:     false,
-				Encoding:   "cl100k_base",
-			},
-		},
-		{
-			name:  "gpt-2",
-			model: "gpt-2",
-			expected: ModelCapability{
-				MaxContext: 2048,
-				Vision:     false,
-				Encoding:   "gpt2",
-			},
-		},
-		{
-			name:  "unknown model",
-			model: "unknown-model",
-			expected: ModelCapability{
-				MaxContext: 8192,
-				Vision:     false,
-				Encoding:   "cl100k_base",
-			},
-		},
+func createTestFile(t *testing.T) string {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, testFileName)
+
+	err := os.WriteFile(tmpFile, []byte(sampleFileContent), 0o600)
+	if err != nil {
+		t.Fatalf(fmtReadFileErr, err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := getModelCapability(tt.model)
+	return tmpFile
+}
 
-			if result.MaxContext != tt.expected.MaxContext {
-				t.Errorf("MaxContext = %d, want %d", result.MaxContext, tt.expected.MaxContext)
-			}
-			if result.Vision != tt.expected.Vision {
-				t.Errorf("Vision = %v, want %v", result.Vision, tt.expected.Vision)
-			}
-			if result.Encoding != tt.expected.Encoding {
-				t.Errorf("Encoding = %q, want %q", result.Encoding, tt.expected.Encoding)
-			}
+func validateFileContent(t *testing.T, content string) {
+	t.Helper()
+
+	if content != sampleFileContent {
+		t.Errorf(fmtReadFileWant, content, sampleFileContent)
+	}
+}
+
+func TestReadFile(t *testing.T) {
+	t.Parallel()
+
+	tmpFile := createTestFile(t)
+
+	content, err := readFile(tmpFile)
+	if err != nil {
+		t.Errorf(fmtReadFileErr, err)
+
+		return
+	}
+
+	validateFileContent(t, content)
+
+	_, err = readFile(invalidPath)
+	if err == nil {
+		t.Error(fmtShouldErrNE)
+	}
+}
+
+func TestReadStdin(t *testing.T) {
+	t.Parallel()
+	t.Skip(skipReadStdin)
+}
+
+type truncateTestCase struct {
+	name   string
+	input  string
+	want   string
+	maxLen int
+}
+
+func runTruncateTest(t *testing.T, testCase truncateTestCase) {
+	t.Helper()
+	t.Parallel()
+
+	result := truncateText(testCase.input, testCase.maxLen)
+	if result != testCase.want {
+		t.Errorf(
+			fmtTruncateText,
+			testCase.input,
+			testCase.maxLen,
+			result,
+			testCase.want,
+		)
+	}
+}
+
+func TestTruncateText(t *testing.T) {
+	t.Parallel()
+
+	tests := []truncateTestCase{
+		{name: "short text", input: hello, maxLen: 10, want: hello},
+		{name: "exact length", input: hello, maxLen: 5, want: hello},
+		{
+			name:   "truncate needed",
+			input:  "hello world this is a long text",
+			maxLen: 10,
+			want:   "hello w...",
+		},
+		{name: "very short maxLen", input: hello, maxLen: 3, want: "..."},
+		{name: "empty input", input: "", maxLen: 10, want: ""},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			runTruncateTest(t, testCase)
 		})
 	}
 }
 
-func TestEncodeWithModel(t *testing.T) {
-	tests := []struct {
-		name    string
-		text    string
-		model   tokenizer.Model
-		wantErr bool
-	}{
-		{
-			name:    "valid text with gpt-4",
-			text:    "Hello world",
-			model:   tokenizer.GPT4,
-			wantErr: false,
-		},
-		{
-			name:    "empty text",
-			text:    "",
-			model:   tokenizer.GPT4,
-			wantErr: false,
-		},
-		{
-			name:    "invalid model",
-			text:    "Hello world",
-			model:   tokenizer.Model("invalid-model"),
-			wantErr: true,
-		},
+func getTestTokenResult(t *testing.T) *TokenResult {
+	t.Helper()
+
+	result, err := tokenizeText(helloWorld, false)
+	if err != nil {
+		t.Fatalf(fmtTokErr, err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tokens, _, err := encodeWithModel(tt.text, tt.model)
+	return result
+}
 
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("encodeWithModel() expected error but got none")
-				}
-				return
-			}
+func marshalResult(t *testing.T, result *TokenResult) []byte {
+	t.Helper()
 
-			if err != nil {
-				t.Errorf("encodeWithModel() unexpected error: %v", err)
-				return
-			}
+	jsonData, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf(fmtJSONMarshalErr, err)
+	}
 
-			if tt.text == "" && len(tokens) != 0 {
-				t.Errorf("encodeWithModel() for empty text returned %d tokens, want 0", len(tokens))
-			}
+	return jsonData
+}
 
-			if tt.text != "" && len(tokens) == 0 {
-				t.Errorf("encodeWithModel() for non-empty text returned 0 tokens")
-			}
-		})
+func unmarshalResult(t *testing.T, jsonData []byte) *TokenResult {
+	t.Helper()
+
+	var unmarshaled TokenResult
+
+	err := json.Unmarshal(jsonData, &unmarshaled)
+	if err != nil {
+		t.Errorf(fmtJSONUnmarshalErr, err)
+	}
+
+	return &unmarshaled
+}
+
+func validateTextField(t *testing.T, original, unmarshaled *TokenResult) {
+	t.Helper()
+
+	if unmarshaled.Text != original.Text {
+		t.Errorf(fmtRoundtripText, unmarshaled.Text, original.Text)
 	}
 }
 
-func TestEncodeWithEncoding(t *testing.T) {
-	tests := []struct {
-		name     string
-		text     string
-		encoding tokenizer.Encoding
-		wantErr  bool
-	}{
-		{
-			name:     "valid text with cl100k_base",
-			text:     "Hello world",
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "empty text",
-			text:     "",
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "invalid encoding",
-			text:     "Hello world",
-			encoding: tokenizer.Encoding("invalid-encoding"),
-			wantErr:  true,
-		},
-	}
+func validateTokenCountField(t *testing.T, original, unmarshaled *TokenResult) {
+	t.Helper()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tokens, _, err := encodeWithEncoding(tt.text, tt.encoding)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("encodeWithEncoding() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("encodeWithEncoding() unexpected error: %v", err)
-				return
-			}
-
-			if tt.text == "" && len(tokens) != 0 {
-				t.Errorf("encodeWithEncoding() for empty text returned %d tokens, want 0", len(tokens))
-			}
-
-			if tt.text != "" && len(tokens) == 0 {
-				t.Errorf("encodeWithEncoding() for non-empty text returned 0 tokens")
-			}
-		})
+	if unmarshaled.TokenCount != original.TokenCount {
+		t.Errorf(fmtRoundtripTokens, unmarshaled.TokenCount, original.TokenCount)
 	}
 }
 
-func TestDecodeWithModel(t *testing.T) {
-	tests := []struct {
-		name     string
-		tokenIDs []uint
-		model    tokenizer.Model
-		wantErr  bool
-	}{
-		{
-			name:     "valid tokens with gpt-4",
-			tokenIDs: []uint{9906, 1917},
-			model:    tokenizer.GPT4,
-			wantErr:  false,
-		},
-		{
-			name:     "empty tokens",
-			tokenIDs: []uint{},
-			model:    tokenizer.GPT4,
-			wantErr:  false,
-		},
-		{
-			name:     "invalid model",
-			tokenIDs: []uint{9906, 1917},
-			model:    tokenizer.Model("invalid-model"),
-			wantErr:  true,
-		},
-	}
+func validateModelField(t *testing.T, original, unmarshaled *TokenResult) {
+	t.Helper()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := decodeWithModel(tt.tokenIDs, tt.model)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("decodeWithModel() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("decodeWithModel() unexpected error: %v", err)
-				return
-			}
-
-			if len(tt.tokenIDs) == 0 && result != "" {
-				t.Errorf("decodeWithModel() for empty tokens returned %q, want empty string", result)
-			}
-		})
+	if unmarshaled.Model != original.Model {
+		t.Errorf(fmtRoundtripModel, unmarshaled.Model, original.Model)
 	}
 }
 
-func TestDecodeWithEncoding(t *testing.T) {
-	tests := []struct {
-		name     string
-		tokenIDs []uint
-		encoding tokenizer.Encoding
-		wantErr  bool
-	}{
-		{
-			name:     "valid tokens with cl100k_base",
-			tokenIDs: []uint{9906, 1917},
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "empty tokens",
-			tokenIDs: []uint{},
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "invalid encoding",
-			tokenIDs: []uint{9906, 1917},
-			encoding: tokenizer.Encoding("invalid-encoding"),
-			wantErr:  true,
-		},
-	}
+func TestJSONOutput(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := decodeWithEncoding(tt.tokenIDs, tt.encoding)
+	result := getTestTokenResult(t)
+	jsonData := marshalResult(t, result)
+	unmarshaled := unmarshalResult(t, jsonData)
 
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("decodeWithEncoding() expected error but got none")
-				}
-				return
-			}
+	validateTextField(t, result, unmarshaled)
+	validateTokenCountField(t, result, unmarshaled)
+	validateModelField(t, result, unmarshaled)
+}
 
-			if err != nil {
-				t.Errorf("decodeWithEncoding() unexpected error: %v", err)
-				return
-			}
-
-			if len(tt.tokenIDs) == 0 && result != "" {
-				t.Errorf("decodeWithEncoding() for empty tokens returned %q, want empty string", result)
-			}
-		})
+func createSampleTokenResult() *TokenResult {
+	return &TokenResult{
+		Text:           testValue,
+		TokenCount:     5,
+		Model:          simpleText,
+		OriginalText:   sampleOrig,
+		NormalizedText: testValue,
 	}
 }
 
-func TestCountTokensWithModel(t *testing.T) {
-	tests := []struct {
-		name    string
-		text    string
-		model   tokenizer.Model
-		wantErr bool
-	}{
-		{
-			name:    "valid text with gpt-4",
-			text:    "Hello world",
-			model:   tokenizer.GPT4,
-			wantErr: false,
-		},
-		{
-			name:    "empty text",
-			text:    "",
-			model:   tokenizer.GPT4,
-			wantErr: false,
-		},
-		{
-			name:    "invalid model",
-			text:    "Hello world",
-			model:   tokenizer.Model("invalid-model"),
-			wantErr: true,
-		},
-	}
+func validateJSONField(t *testing.T, jsonStr, field string) {
+	t.Helper()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := countTokensWithModel(tt.text, tt.model)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("countTokensWithModel() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("countTokensWithModel() unexpected error: %v", err)
-				return
-			}
-
-			if result < 0 {
-				t.Errorf("countTokensWithModel() returned negative value: %d", result)
-			}
-
-			if tt.text == "" && result != 0 {
-				t.Errorf("countTokensWithModel() for empty text = %d, want 0", result)
-			}
-		})
+	if !strings.Contains(jsonStr, field) {
+		t.Errorf(fmtMissingField, field, jsonStr)
 	}
 }
 
-func TestCountTokensWithEncoding(t *testing.T) {
-	tests := []struct {
-		name     string
-		text     string
-		encoding tokenizer.Encoding
-		wantErr  bool
-	}{
-		{
-			name:     "valid text with cl100k_base",
-			text:     "Hello world",
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "empty text",
-			text:     "",
-			encoding: tokenizer.Cl100kBase,
-			wantErr:  false,
-		},
-		{
-			name:     "invalid encoding",
-			text:     "Hello world",
-			encoding: tokenizer.Encoding("invalid-encoding"),
-			wantErr:  true,
-		},
+func TestTokenResultStructure(t *testing.T) {
+	t.Parallel()
+
+	result := createSampleTokenResult()
+	jsonData := marshalResult(t, result)
+	jsonStr := string(jsonData)
+
+	expectedFields := []string{
+		jsonTextField,
+		jsonTokenCountField,
+		jsonModelField,
+		jsonOriginalText,
+		jsonNormalizedText,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := countTokensWithEncoding(tt.text, tt.encoding)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("countTokensWithEncoding() expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("countTokensWithEncoding() unexpected error: %v", err)
-				return
-			}
-
-			if result < 0 {
-				t.Errorf("countTokensWithEncoding() returned negative value: %d", result)
-			}
-
-			if tt.text == "" && result != 0 {
-				t.Errorf("countTokensWithEncoding() for empty text = %d, want 0", result)
-			}
-		})
+	for _, field := range expectedFields {
+		validateJSONField(t, jsonStr, field)
 	}
 }
 
-func TestEstimateTokens(t *testing.T) {
-	tests := []struct {
-		name     string
-		text     string
-		expected int
-	}{
-		{"empty string", "", 0},
-		{"short text", "Hello", 1},
-		{"medium text", "Hello world", 2},
-		{"longer text", "This is a longer text that should have more tokens", 12},
+func TestVersionInfo(t *testing.T) {
+	t.Parallel()
+
+	if DefaultVersion == "" {
+		t.Log(logEmptyVersion)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := estimateTokens(tt.text)
-			if result != tt.expected {
-				t.Errorf("estimateTokens() = %d, want %d", result, tt.expected)
-			}
-		})
+	if DefaultBuildTime == "" {
+		t.Log(logEmptyBuildTime)
 	}
+
+	_ = DefaultVersion
+	_ = DefaultBuildTime
 }
 
-func TestChunkText(t *testing.T) {
-	tests := []struct {
-		name      string
-		text      string
-		maxTokens int
-		model     string
-		encoding  string
-		expected  int // expected number of chunks
-	}{
-		{
-			name:      "short text within limit",
-			text:      "Hello world",
-			maxTokens: 10,
-			model:     "gpt-4",
-			encoding:  "",
-			expected:  1,
-		},
-		{
-			name:      "text that needs chunking",
-			text:      "This is a longer text that should be split into multiple chunks because it exceeds the token limit",
-			maxTokens: 5,
-			model:     "gpt-4",
-			encoding:  "",
-			expected:  4, // Should be split into multiple chunks
-		},
-		{
-			name:      "empty text",
-			text:      "",
-			maxTokens: 10,
-			model:     "gpt-4",
-			encoding:  "",
-			expected:  0, // Empty text results in 0 chunks
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			chunks := chunkText(tt.text, tt.maxTokens, tt.model, tt.encoding)
-
-			if len(chunks) != tt.expected {
-				t.Errorf("chunkText() returned %d chunks, want %d", len(chunks), tt.expected)
-			}
-
-			// Verify that each chunk doesn't exceed the token limit
-			for i, chunk := range chunks {
-				if chunk.Tokens > tt.maxTokens {
-					t.Errorf("chunk %d has %d tokens, exceeds limit of %d", i, chunk.Tokens, tt.maxTokens)
-				}
-			}
-
-			// Verify that all chunks have valid indices
-			for i, chunk := range chunks {
-				if chunk.Index != i {
-					t.Errorf("chunk %d has index %d, want %d", i, chunk.Index, i)
-				}
-			}
-		})
-	}
-}
-
-func TestOutputResult(t *testing.T) {
-	tests := []struct {
-		name     string
-		result   TokenEstimate
-		useJSON  bool
-		expected string
-	}{
-		{
-			name: "JSON output",
-			result: TokenEstimate{
-				Model:        "gpt-4",
-				Tokens:       5,
-				Budget:       1000,
-				WithinBudget: true,
-			},
-			useJSON:  true,
-			expected: `"model"`,
-		},
-		{
-			name: "text output",
-			result: TokenEstimate{
-				Model:        "gpt-4",
-				Tokens:       5,
-				Budget:       1000,
-				WithinBudget: true,
-			},
-			useJSON:  false,
-			expected: "Model: gpt-4",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Capture stdout
-			oldStdout := os.Stdout
-			r, w, _ := os.Pipe()
-			os.Stdout = w
-
-			outputResult(tt.result, tt.useJSON)
-
-			w.Close()
-			os.Stdout = oldStdout
-
-			output, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("Failed to read stdout: %v", err)
-			}
-
-			outputStr := string(output)
-			if !strings.Contains(outputStr, tt.expected) {
-				t.Errorf("outputResult() output does not contain expected string. Got: %s", outputStr)
-			}
-		})
-	}
-}
-
-func TestHandleError(t *testing.T) {
-	tests := []struct {
-		name     string
-		err      error
-		useJSON  bool
-		expected string
-	}{
-		{
-			name:     "JSON error output",
-			err:      ErrTextRequired,
-			useJSON:  true,
-			expected: `"error":"text content is required for estimation"`,
-		},
-		{
-			name:     "text error output",
-			err:      ErrTextRequired,
-			useJSON:  false,
-			expected: "Error: text content is required for estimation",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Capture stderr
-			oldStderr := os.Stderr
-			r, w, _ := os.Pipe()
-			os.Stderr = w
-
-			// We need to prevent the program from actually exiting
-			// This is a limitation of testing os.Exit
-			defer func() {
-				os.Stderr = oldStderr
-			}()
-
-			// Note: This test is limited because handleError calls os.Exit(1)
-			// In a real scenario, you might want to refactor to make this more testable
-			_ = tt
-			_ = r
-			w.Close()
-		})
-	}
-}
-
-// Benchmark tests
-func BenchmarkEncodeWithModel(b *testing.B) {
-	text := "This is a benchmark test for encoding with model."
-	model := tokenizer.GPT4
+func BenchmarkTokenizeText(b *testing.B) {
+	input := benchInput
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		encodeWithModel(text, model)
+
+	for range b.N {
+		_, err := tokenizeText(input, false)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
-func BenchmarkEncodeWithEncoding(b *testing.B) {
-	text := "This is a benchmark test for encoding with encoding."
-	encoding := tokenizer.Cl100kBase
+func BenchmarkTokenizeTextWithNormalization(b *testing.B) {
+	input := benchInput
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		encodeWithEncoding(text, encoding)
+
+	for range b.N {
+		_, err := tokenizeText(input, true)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
-func BenchmarkCountTokensWithModel(b *testing.B) {
-	text := "This is a benchmark test for counting tokens with model."
-	model := tokenizer.GPT4
+func BenchmarkJSONMarshaling(b *testing.B) {
+	result := &TokenResult{
+		Text:           testValue,
+		TokenCount:     10,
+		Model:          simpleText,
+		OriginalText:   benchOrig,
+		NormalizedText: testValue,
+	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		countTokensWithModel(text, model)
+
+	for range b.N {
+		_, err := json.Marshal(result)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
-func BenchmarkCountTokensWithEncoding(b *testing.B) {
-	text := "This is a benchmark test for counting tokens with encoding."
-	encoding := tokenizer.Cl100kBase
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		countTokensWithEncoding(text, encoding)
+func createEdgeCaseName(input string) string {
+	name := edgeCasePrefix
+	if input != "" {
+		name += "_" + input[:minInt(len(input), 10)]
 	}
+
+	return name
 }
 
-func BenchmarkChunkText(b *testing.B) {
-	text := "This is a benchmark test for chunking text. It contains multiple sentences and should be split into chunks based on the token limit."
-	maxTokens := 10
-	model := "gpt-4"
-	encoding := ""
+func runEdgeCaseTest(t *testing.T, input string) {
+	t.Helper()
+	t.Parallel()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		chunkText(text, maxTokens, model, encoding)
+	result, err := tokenizeText(input, true)
+	if err != nil {
+		t.Errorf(fmtUnexpErr, input, err)
+
+		return
+	}
+
+	assertTokenCommon(t, input, true, result)
+}
+
+func TestErrorConditions(t *testing.T) {
+	t.Parallel()
+
+	edgeCases := []string{
+		"",                         // empty
+		" ",                        // single space
+		"\n\t\r",                   // only whitespace
+		"🌟🎉😀",                      // only emojis
+		"café naïve résumé",        // unicode
+		strings.Repeat("a", 10000), // very long string
+	}
+
+	for _, input := range edgeCases {
+		name := createEdgeCaseName(input)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			runEdgeCaseTest(t, input)
+		})
 	}
 }

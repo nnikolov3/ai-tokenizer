@@ -1,8 +1,5 @@
 module github.com/nnikolov3/ai-tokenizer
 
-go 1.25
+go 1.25.0
 
-require (
-	github.com/dlclark/regexp2 v1.11.5 // indirect
-	github.com/tiktoken-go/tokenizer v0.7.0 // indirect
-)
+require golang.org/x/text v0.28.0 // indirect
